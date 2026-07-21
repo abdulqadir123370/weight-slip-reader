@@ -1,0 +1,16 @@
+{
+  "name": "weight-slip-reader",
+  "version": "1.0.0",
+  "description": "Small service that reads a photo of a printed digital-scale weight slip and extracts the weight, using Claude's vision API. Built for the Brush Manufacturing Tracker's Sales tab.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "express-rate-limit": "^7.4.0",
+    "dotenv": "^16.4.5"
+  }
+}
