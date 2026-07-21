@@ -52,6 +52,10 @@ function requireAuth(req, res, next) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!SHARED_SECRET || token !== SHARED_SECRET) {
+    console.warn('Rejected request: secret mismatch or missing.', {
+      hasServerSecret: !!SHARED_SECRET,
+      gotToken: token ? `${token.slice(0,4)}...(${token.length} chars)` : '(none)'
+    });
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
   next();
