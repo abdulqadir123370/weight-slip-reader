@@ -16,6 +16,11 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+// Railway (like most hosts) puts your app behind a reverse proxy, which sets X-Forwarded-For
+// to record the visitor's real IP. Without this line, Express doesn't trust that header, and
+// express-rate-limit refuses to guess at an IP for safety — throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+// and crashing every request before it reaches the actual slip-reading logic below.
+app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 8080;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
