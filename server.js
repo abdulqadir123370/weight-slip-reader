@@ -1,147 +1,110 @@
-// weight-slip-reader
-// A small, single-purpose service: receives a photo of a printed digital-scale weight slip,
-// asks Claude to read the weight off it, and returns structured JSON. Built to sit alongside
-// your existing royal-plastics-bot on Railway — same deploy pattern, same idea (Claude doing
-// one well-defined job behind a small server, key kept server-side).
+// ============================================================================
+// WEIGHT SLIP READER v2 — reads net weight AND the printed date from a photo
+// of a scale receipt. Drop-in replacement for the v1 service; same URL, same
+// endpoint, same auth, same request/response shape — PLUS two new fields:
+//   slipDate           "YYYY-MM-DD" or null — the date printed on the slip
+//   slipDateConfidence "high" | "medium" | "low"
+// The BrushTracker app (build 1786349383507+) already consumes both.
 //
-// SECURITY NOTE: this endpoint is protected by a shared-secret header, not because the data
-// is sensitive, but because every call costs you a small amount of Anthropic API usage — the
-// secret stops a stranger who stumbles on this URL from running up your bill. It is NOT the
-// same kind of secret as your Anthropic API key itself (that one stays server-side only, in
-// this file's environment variables, and is never sent to the browser).
+// Zero npm dependencies — pure Node (18+). Railway env vars required:
+//   ANTHROPIC_API_KEY   (unchanged from v1)
+//   SHARED_SECRET       (unchanged — must match WEIGHT_SLIP_READER_SECRET in the app)
+//   MODEL               optional, defaults to claude-haiku-4-5 (cheap, fast, accurate for OCR)
+//   PORT                provided by Railway automatically
+// ============================================================================
+const http = require('http');
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
-
-const app = express();
-// Railway (like most hosts) puts your app behind a reverse proxy, which sets X-Forwarded-For
-// to record the visitor's real IP. Without this line, Express doesn't trust that header, and
-// express-rate-limit refuses to guess at an IP for safety — throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
-// and crashing every request before it reaches the actual slip-reading logic below.
-app.set('trust proxy', 1);
-
-const PORT = process.env.PORT || 8080;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const API_KEY = process.env.ANTHROPIC_API_KEY;
 const SHARED_SECRET = process.env.SHARED_SECRET;
-// Comma-separated list, e.g. "https://abdulqadir123370.github.io,http://localhost:5500"
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+const MODEL = process.env.MODEL || 'claude-haiku-4-5';
+const PORT = process.env.PORT || 8080;
 
-if (!ANTHROPIC_API_KEY) console.warn('⚠️  ANTHROPIC_API_KEY is not set — /read-slip will fail.');
-if (!SHARED_SECRET) console.warn('⚠️  SHARED_SECRET is not set — the endpoint is effectively unprotected!');
-if (ALLOWED_ORIGINS.length === 0) console.warn('⚠️  ALLOWED_ORIGIN is not set — CORS will block all browser requests.');
+const PROMPT = `You are reading a photo of a printed weighing-scale receipt (weight slip) from a factory in Pakistan. Extract exactly two things:
 
-app.use(cors({
-  origin: function(origin, callback) {
-    // Allow server-to-server / curl calls with no Origin header (e.g. your own health checks),
-    // but browser requests must come from an allow-listed origin.
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    return callback(new Error('Origin not allowed: ' + origin));
-  }
-}));
-app.use(express.json({ limit: '12mb' })); // base64 photos inflate ~33% over the raw file size
+1. NET WEIGHT in kilograms. Slips may show gross/tare/net — always prefer the NET figure. If only one weight is printed, use it. Convert grams to KG if needed.
+2. THE DATE printed on the slip. Pakistani slips normally print dates day-first (DD/MM/YYYY or DD-MM-YY). Interpret day-first unless the slip explicitly shows otherwise. Convert to ISO format YYYY-MM-DD.
 
-// Modest rate limit — a normal work day of sale entries is nowhere near this; it exists purely
-// to cap worst-case cost if the URL ever leaks or gets hit by something automated.
-app.use('/read-slip', rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, error: 'Rate limit reached. Try again shortly.' }
-}));
-
-function requireAuth(req, res, next) {
-  const auth = req.headers.authorization || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!SHARED_SECRET || token !== SHARED_SECRET) {
-    console.warn('Rejected request: secret mismatch or missing.', {
-      hasServerSecret: !!SHARED_SECRET,
-      gotToken: token ? `${token.slice(0,4)}...(${token.length} chars)` : '(none)'
-    });
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
-  }
-  next();
+Respond with ONLY a JSON object, no markdown fences, no other text:
+{
+  "netWeightKg": <number or null if no weight is readable>,
+  "confidence": "<high|medium|low>",
+  "slipDate": "<YYYY-MM-DD or null if no date is readable>",
+  "slipDateConfidence": "<high|medium|low>",
+  "notes": "<very short note ONLY if something is ambiguous, else empty string>"
 }
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+Confidence rules — be strict, a wrong number silently accepted is worse than a rejection:
+- "high" only when the figure is clearly printed and unambiguous.
+- Blurry, cut off, handwritten, multiple conflicting candidates, or ambiguous day/month → "medium" or "low".
+- A date whose year is missing → report with "low" confidence using the most recent plausible year.`;
 
-app.post('/read-slip', requireAuth, async (req, res) => {
-  try {
-    const { image, mediaType } = req.body || {};
-    if (!image || typeof image !== 'string') {
-      return res.status(400).json({ success: false, error: 'Missing "image" (base64 string) in request body.' });
+function json(res, code, obj){
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*',
+    'Access-Control-Allow-Headers':'Content-Type, Authorization', 'Access-Control-Allow-Methods':'POST, GET, OPTIONS'});
+  res.end(body);
+}
+
+const server = http.createServer((req, res) => {
+  if(req.method === 'OPTIONS'){ return json(res, 204, {}); }
+  if(req.method === 'GET'){ return json(res, 200, {ok:true, service:'weight-slip-reader', version:2, dateExtraction:true}); }
+  if(req.method !== 'POST' || !req.url.startsWith('/read-slip')){ return json(res, 404, {success:false, error:'not found'}); }
+
+  const auth = req.headers['authorization'] || '';
+  if(!SHARED_SECRET || auth !== 'Bearer ' + SHARED_SECRET){ return json(res, 401, {success:false, error:'unauthorized'}); }
+  if(!API_KEY){ return json(res, 500, {success:false, error:'ANTHROPIC_API_KEY not configured'}); }
+
+  let chunks = []; let size = 0;
+  req.on('data', c => { size += c.length; if(size > 15*1024*1024){ req.destroy(); } else chunks.push(c); });
+  req.on('end', async () => {
+    let body;
+    try{ body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+    catch(e){ return json(res, 400, {success:false, error:'invalid JSON body'}); }
+    const image = body && body.image;
+    const mediaType = (body && body.mediaType) || 'image/jpeg';
+    if(!image || typeof image !== 'string'){ return json(res, 400, {success:false, error:'missing image (base64)'}); }
+
+    try{
+      const apiResp = await fetch('https://api.anthropic.com/v1/messages', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json', 'x-api-key':API_KEY, 'anthropic-version':'2023-06-01' },
+        body: JSON.stringify({
+          model: MODEL, max_tokens: 400,
+          messages: [{ role:'user', content: [
+            { type:'image', source:{ type:'base64', media_type: mediaType, data: image } },
+            { type:'text', text: PROMPT }
+          ]}]
+        })
+      });
+      const data = await apiResp.json();
+      if(!apiResp.ok){
+        console.error('Anthropic API error:', apiResp.status, JSON.stringify(data).slice(0,300));
+        return json(res, 502, {success:false, error:'reader model error ('+apiResp.status+')'});
+      }
+      const text = (data.content||[]).map(b=>b.type==='text'?b.text:'').join('').replace(/```json|```/g,'').trim();
+      let parsed;
+      try{ parsed = JSON.parse(text); }
+      catch(e){
+        console.error('Unparseable model reply:', text.slice(0,200));
+        return json(res, 200, {success:true, netWeightKg:null, confidence:'low', slipDate:null, slipDateConfidence:'low', notes:'reader reply unparseable'});
+      }
+      // Sanitize — never trust shape blindly
+      const kg = (typeof parsed.netWeightKg==='number' && isFinite(parsed.netWeightKg) && parsed.netWeightKg>0 && parsed.netWeightKg<100000) ? parsed.netWeightKg : null;
+      const conf = ['high','medium','low'].includes(parsed.confidence) ? parsed.confidence : 'low';
+      let slipDate = null, dConf = 'low';
+      if(typeof parsed.slipDate==='string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.slipDate) && !isNaN(new Date(parsed.slipDate).getTime())){
+        const y = +parsed.slipDate.slice(0,4);
+        if(y>=2020 && y<=2035){
+          slipDate = parsed.slipDate;
+          dConf = ['high','medium','low'].includes(parsed.slipDateConfidence) ? parsed.slipDateConfidence : 'low';
+        }
+      }
+      return json(res, 200, {success:true, netWeightKg:kg, confidence:conf, slipDate, slipDateConfidence:dConf, notes: String(parsed.notes||'').slice(0,200)});
+    }catch(e){
+      console.error('read-slip failed:', e);
+      return json(res, 502, {success:false, error:'reader service error'});
     }
-    const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-    const mt = validTypes.includes(mediaType) ? mediaType : 'image/jpeg';
-
-    const prompt = `You are reading a photo of a printed receipt from a digital weighing scale. It records the weight of a wastage material (Bhusa, Patti, or Gitta — by-products from wooden broom manufacturing) being sold by weight.
-
-Look at the image and extract:
-- netWeightKg: the NET weight in kilograms. If the slip shows gross/tare/net weights, use NET specifically. If only one weight is printed, use that one. If the unit shown isn't KG, convert it to KG.
-- slipDate: any printed date on the slip, formatted YYYY-MM-DD, or null if none is visible.
-- slipNumber: any printed ticket/slip/receipt number, or null if none is visible.
-- confidence: "high", "medium", or "low", based on how clearly you could read the weight number specifically.
-- notes: a short note if anything was ambiguous or you had to guess — otherwise an empty string.
-
-Respond with ONLY a JSON object and nothing else — no markdown code fences, no explanation before or after.
-
-If you cannot find any clear weight value anywhere on the slip, respond with netWeightKg: null and explain what you do see in "notes".`;
-
-    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 400,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mt, data: image } },
-            { type: 'text', text: prompt }
-          ]
-        }]
-      })
-    });
-
-    if (!apiRes.ok) {
-      const errBody = await apiRes.text().catch(() => '');
-      console.error('Anthropic API error:', apiRes.status, errBody.slice(0, 500));
-      return res.status(502).json({ success: false, error: 'Could not reach the reading service right now.' });
-    }
-
-    const data = await apiRes.json();
-    const rawText = (data.content || []).map(b => b.text || '').join('').trim();
-
-    let parsed;
-    try {
-      const cleaned = rawText.replace(/^```json\s*|^```\s*|```\s*$/gm, '').trim();
-      parsed = JSON.parse(cleaned);
-    } catch (e) {
-      console.error('Failed to parse model output as JSON:', rawText.slice(0, 300));
-      return res.status(502).json({ success: false, error: 'Got an unreadable response from the reading model.' });
-    }
-
-    return res.json({
-      success: true,
-      netWeightKg: typeof parsed.netWeightKg === 'number' ? parsed.netWeightKg : null,
-      slipDate: parsed.slipDate || null,
-      slipNumber: parsed.slipNumber || null,
-      confidence: parsed.confidence || 'low',
-      notes: parsed.notes || ''
-    });
-  } catch (e) {
-    console.error('Unexpected error in /read-slip:', e);
-    return res.status(500).json({ success: false, error: 'Unexpected server error.' });
-  }
+  });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`weight-slip-reader listening on 0.0.0.0:${PORT}`);
-});
+server.listen(PORT, () => console.log('weight-slip-reader v2 (with date extraction) listening on', PORT));
