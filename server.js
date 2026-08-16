@@ -61,14 +61,121 @@ function json(res, code, obj){
   res.end(body);
 }
 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+
+// ============================================================================
+// /report — AI REPORT ASSISTANT (v5, added 13/08/2026 on Owner request)
+// Architecture decision (agreed with Owner): ALL arithmetic stays in the app's
+// own tested code. The app compiles pre-computed figures (costing rates, pools,
+// totals) and sends them here; the model's ONLY job is selecting, comparing and
+// narrating those figures — it is explicitly instructed never to compute new
+// numbers. A server-side verification pass then extracts every numeric figure
+// the report quotes and checks it exists in the input data; unmatched figures
+// are listed in an "unverified" footer rather than silently trusted. Runs on
+// Gemini's free tier (GEMINI_API_KEY env var, from aistudio.google.com) —
+// model-agnostic on purpose, one env-var swap away from anything else.
+// ============================================================================
+const REPORT_PROMPT_HEADER = `You are the reporting assistant for a brush manufacturing factory's tracking system (Royal Plastics, Karachi). You will receive (1) a question from the factory owner and (2) a JSON dataset of PRE-COMPUTED figures from the factory's audited tracking software.
+
+STRICT RULES — these exist because your report may drive real business decisions:
+- Quote ONLY numbers that appear in the dataset. NEVER compute, derive, add, subtract, average or estimate new numbers yourself — not even simple sums. The software already computed everything trustworthy.
+- If answering well would require arithmetic the dataset doesn't already contain, say so plainly ("the system doesn't pre-compute X") and describe the DIRECTION of the comparison in words instead (higher/lower/roughly similar), without inventing a magnitude.
+- If the dataset doesn't contain what's asked, say exactly that. Never guess or fill gaps.
+- Currency is Pakistani Rupees (Rs.), weights in KG, quantities in pcs. Dates are YYYY-MM-DD.
+- Be direct and structured: short headed sections, the key finding first. Flag anything that looks like a problem (negative variance, pending approvals, cash owed, unusually low yield) prominently.
+- Write in the language the question was asked in (English, Urdu, or Roman Urdu).
+
+Now the owner's question and the dataset follow.`;
+
+function collectNumbersFromData(obj, out){
+  if(obj==null) return;
+  if(typeof obj==='number' && isFinite(obj)){
+    const a = Math.abs(obj); // prose writes "-35 KG" as "shortfall of 35 KG" — abs variants must match
+    out.add(String(obj)); out.add(String(a));
+    out.add(String(Math.round(obj))); out.add(String(Math.round(a)));
+    out.add(obj.toFixed(1)); out.add(obj.toFixed(2));
+    out.add(a.toFixed(1)); out.add(a.toFixed(2));
+    out.add(Math.round(a).toLocaleString('en-US'));
+    return;
+  }
+  if(typeof obj==='string'){
+    // strings in the data may themselves contain figures (e.g. "@ Rs.43/pc")
+    (obj.match(/\d[\d,]*\.?\d*/g)||[]).forEach(n=>{ out.add(n); out.add(n.replace(/,/g,'')); });
+    return;
+  }
+  if(Array.isArray(obj)){ obj.forEach(v=>collectNumbersFromData(v,out)); return; }
+  if(typeof obj==='object'){ Object.values(obj).forEach(v=>collectNumbersFromData(v,out)); return; }
+}
+function verifyReportNumbers(report, data){
+  const known = new Set();
+  collectNumbersFromData(data, known);
+  // small integers 0-31 are almost always dates/counts/ordinals in prose — too noisy to flag
+  const candidates = (report.match(/\d[\d,]*\.?\d*/g)||[]);
+  const unverified = [];
+  for(const raw of candidates){
+    const clean = raw.replace(/,/g,'');
+    const asNum = parseFloat(clean);
+    if(!isFinite(asNum)) continue;
+    if(asNum>=0 && asNum<=31 && Number.isInteger(asNum)) continue;
+    if(/^20\d\d$/.test(clean)) continue; // years
+    if(known.has(raw) || known.has(clean)) continue;
+    // Exact/formatted matches only for DECIMAL tokens — an integer-rounding fallback here
+    // once let any invented decimal that merely ROUNDS to a known integer slip through
+    // (e.g. a hallucinated "1.87" passing because a real "2.01" put "2" in the known set).
+    // Integer tokens may still match the .0 form of a real decimal (report "205" vs data 205.0).
+    if(Number.isInteger(asNum) && !clean.includes('.') && (known.has(asNum.toFixed(1)) || known.has(asNum.toFixed(2)))) continue;
+    // Decimal tokens: exact or 2-decimal match ONLY. The 1-decimal tolerance was itself a
+    // leak — a real 1.95 puts "1.9" in the known set, and a hallucinated 1.87 also rounds
+    // to "1.9". Data-side variants already cover legitimate roundings (report "87.3" matches
+    // data 87.31 through the data's own toFixed(1) entry), so the token side stays strict.
+    if(clean.includes('.') && known.has(asNum.toFixed(2))) continue;
+    if(!unverified.includes(raw)) unverified.push(raw);
+  }
+  return unverified;
+}
+
+async function handleReport(req, res, body){
+  if(!GEMINI_API_KEY){ return json(res, 500, {success:false, error:'GEMINI_API_KEY not configured on the server'}); }
+  const question = (body && typeof body.question==='string') ? body.question.trim().slice(0, 2000) : '';
+  const data = body && body.data;
+  if(!question){ return json(res, 400, {success:false, error:'missing question'}); }
+  if(!data || typeof data!=='object'){ return json(res, 400, {success:false, error:'missing data'}); }
+  const dataStr = JSON.stringify(data);
+  if(dataStr.length > 400000){ return json(res, 400, {success:false, error:'dataset too large'}); }
+  try{
+    const apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
+        generationConfig:{ temperature: 0.2, maxOutputTokens: 3000 }
+      })
+    });
+    const out = await apiResp.json();
+    if(!apiResp.ok){
+      console.error('Gemini API error:', apiResp.status, JSON.stringify(out).slice(0,300));
+      const hint = apiResp.status===429 ? ' (free-tier rate limit hit — wait a minute and try again)' : '';
+      return json(res, 502, {success:false, error:'report model error ('+apiResp.status+')'+hint});
+    }
+    const report = (((out.candidates||[])[0]||{}).content||{}).parts?.map(p=>p.text||'').join('').trim() || '';
+    if(!report){ return json(res, 502, {success:false, error:'empty report from model'}); }
+    const unverified = verifyReportNumbers(report, data);
+    return json(res, 200, {success:true, report, unverified});
+  }catch(e){
+    console.error('report failed:', e);
+    return json(res, 502, {success:false, error:'report service error'});
+  }
+}
+
 const server = http.createServer((req, res) => {
   if(req.method === 'OPTIONS'){ return json(res, 204, {}); }
-  if(req.method === 'GET'){ return json(res, 200, {ok:true, service:'weight-slip-reader', version:4, dateExtraction:true, maundsCrossCheck:true, serialExtraction:true}); }
-  if(req.method !== 'POST' || !req.url.startsWith('/read-slip')){ return json(res, 404, {success:false, error:'not found'}); }
+  if(req.method === 'GET'){ return json(res, 200, {ok:true, service:'weight-slip-reader', version:5, dateExtraction:true, maundsCrossCheck:true, serialExtraction:true, reportAssistant:true, reportModel:GEMINI_MODEL}); }
+  if(req.method !== 'POST' || !(req.url.startsWith('/read-slip') || req.url.startsWith('/report'))){ return json(res, 404, {success:false, error:'not found'}); }
 
   const auth = req.headers['authorization'] || '';
   if(!SHARED_SECRET || auth !== 'Bearer ' + SHARED_SECRET){ return json(res, 401, {success:false, error:'unauthorized'}); }
-  if(!API_KEY){ return json(res, 500, {success:false, error:'ANTHROPIC_API_KEY not configured'}); }
+  // NOTE: the Anthropic-key check lives on the slip path only (below) — /report runs on
+  // GEMINI_API_KEY and must not fail just because the slip reader's key is absent.
 
   let chunks = []; let size = 0;
   req.on('data', c => { size += c.length; if(size > 15*1024*1024){ req.destroy(); } else chunks.push(c); });
@@ -76,6 +183,8 @@ const server = http.createServer((req, res) => {
     let body;
     try{ body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch(e){ return json(res, 400, {success:false, error:'invalid JSON body'}); }
+    if(req.url.startsWith('/report')){ return handleReport(req, res, body); }
+    if(!API_KEY){ return json(res, 500, {success:false, error:'ANTHROPIC_API_KEY not configured'}); }
     const image = body && body.image;
     const mediaType = (body && body.mediaType) || 'image/jpeg';
     if(!image || typeof image !== 'string'){ return json(res, 400, {success:false, error:'missing image (base64)'}); }
@@ -152,4 +261,4 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, () => console.log('weight-slip-reader v4 (Maunds cross-check + serial/C-No) listening on', PORT));
+server.listen(PORT, () => console.log('weight-slip-reader v5 (slip reading + AI report assistant) listening on', PORT));
