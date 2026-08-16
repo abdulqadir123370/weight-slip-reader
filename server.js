@@ -62,7 +62,13 @@ function json(res, code, obj){
 }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+// Model default fixed 16/08/2026: 'gemini-1.5-flash' was the original default but that
+// model line was retired for new projects back in April 2025 — it was already dead, which
+// is exactly why /report returned a 404 the moment it was first used. gemini-3.5-flash is
+// the current free-tier GA model (confirmed against Google's own pricing page 16/08/2026:
+// genuinely free, not a "-preview" build that can vanish without notice, and the strongest
+// reasoning available at no cost — matters for complicated cost-analysis narration).
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 
 // ============================================================================
 // /report — AI REPORT ASSISTANT (v5, added 13/08/2026 on Owner request)
