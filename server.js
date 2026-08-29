@@ -61,7 +61,9 @@ function json(res, code, obj){
   res.end(body);
 }
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// .trim() added 29/08/2026: a stray space/newline pasted into the Railway var mangles the
+// key and Google then sees NO credential at all ("Expected OAuth 2 access token" 401).
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 // Model default fixed 16/08/2026: 'gemini-1.5-flash' was the original default but that
 // model line was retired for new projects back in April 2025 — it was already dead, which
 // is exactly why /report returned a 404 the moment it was first used. gemini-3.5-flash is
@@ -150,8 +152,10 @@ async function handleReport(req, res, body){
   const dataStr = JSON.stringify(data);
   if(dataStr.length > 400000){ return json(res, 400, {success:false, error:'dataset too large'}); }
   try{
-    const apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
+    // Key moved from ?key= URL param to the x-goog-api-key header 29/08/2026 — Google's
+    // recommended method; also keeps the key out of URLs (which end up in logs/proxies).
+    const apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+      method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
       body: JSON.stringify({
         contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
         generationConfig:{ temperature: 0.2, maxOutputTokens: 3000 }
