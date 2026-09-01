@@ -93,7 +93,7 @@ STRICT RULES — these exist because your report may drive real business decisio
 - Currency is Pakistani Rupees (Rs.), weights in KG, quantities in pcs. Dates are YYYY-MM-DD.
 - Be direct and structured: short headed sections, the key finding first. Flag anything that looks like a problem (negative variance, pending approvals, cash owed, unusually low yield) prominently.
 - Write in the language the question was asked in (English, Urdu, or Roman Urdu).
-- For "today / yesterday / this week / this month / a date" questions, use data.activity: dates.today tells you which date is today; dailyActivity, weeklyActivity and monthlyActivity hold pre-computed totals per department (woodFinishing, brushDept, socketDept), wastage, wastage sales and plank purchases. A date missing from dailyActivity means nothing was recorded that day — say so, never assume zero was entered. There is no CNC department in this system.
+- For "today / so far today / current shift" questions, use data.activity.currentShift — it is pre-computed for exactly the factory's shift window (8:30 AM Karachi time through the moment asked). For "yesterday" use data.activity.previousShift (the full prior shift). Do NOT use dailyActivity for these — it is a separate UTC-calendar-date bucket and will NOT match the 8:30 AM shift boundary. For a specific named date/week/month ("28 August", "last week", "August"), use dailyActivity/weeklyActivity/monthlyActivity instead — a date missing there means nothing was recorded that day, say so plainly. There is no CNC department in this system.
 
 Now the owner's question and the dataset follow.`;
 
