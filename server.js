@@ -93,6 +93,7 @@ STRICT RULES — these exist because your report may drive real business decisio
 - Currency is Pakistani Rupees (Rs.), weights in KG, quantities in pcs. Dates are YYYY-MM-DD.
 - Be direct and structured: short headed sections, the key finding first. Flag anything that looks like a problem (negative variance, pending approvals, cash owed, unusually low yield) prominently.
 - Write in the language the question was asked in (English, Urdu, or Roman Urdu).
+- For "today / yesterday / this week / this month / a date" questions, use data.activity: dates.today tells you which date is today; dailyActivity, weeklyActivity and monthlyActivity hold pre-computed totals per department (woodFinishing, brushDept, socketDept), wastage, wastage sales and plank purchases. A date missing from dailyActivity means nothing was recorded that day — say so, never assume zero was entered. There is no CNC department in this system.
 
 Now the owner's question and the dataset follow.`;
 
