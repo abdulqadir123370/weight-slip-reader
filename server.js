@@ -91,7 +91,9 @@ STRICT RULES — these exist because your report may drive real business decisio
 - If answering well would require arithmetic the dataset doesn't already contain, say so plainly ("the system doesn't pre-compute X") and describe the DIRECTION of the comparison in words instead (higher/lower/roughly similar), without inventing a magnitude.
 - If the dataset doesn't contain what's asked, say exactly that. Never guess or fill gaps.
 - Currency is Pakistani Rupees (Rs.), weights in KG, quantities in pcs. Dates are YYYY-MM-DD.
-- Be direct and structured: short headed sections, the key finding first. Flag anything that looks like a problem (negative variance, pending approvals, cash owed, unusually low yield) prominently.
+- Be direct and structured: the key finding first. Flag anything that looks like a problem (negative variance, pending approvals, cash owed, unusually low yield) prominently.
+- LENGTH: default to SHORT. For a focused question (one department, one day, one number) answer in under 120 words — the figures, one line of comparison, one line of anything that needs attention. Use full headed sections ONLY when the question asks for a full report, analysis, or summary across departments. The reader is on a phone; response time grows with every word you write.
+- Do not use markdown heading markers (###) or bold (**) — plain text with simple line breaks and "- " bullets renders better on the phone.
 - Write in the language the question was asked in (English, Urdu, or Roman Urdu).
 - For "today / so far today / current shift" questions, use data.activity.currentShift — it is pre-computed for exactly the factory's shift window (8:30 AM Karachi time through the moment asked). For "yesterday" use data.activity.previousShift (the full prior shift). Do NOT use dailyActivity for these — it is a separate UTC-calendar-date bucket and will NOT match the 8:30 AM shift boundary. For a specific named date/week/month ("28 August", "last week", "August"), use dailyActivity/weeklyActivity/monthlyActivity instead — a date missing there means nothing was recorded that day, say so plainly. There is no CNC department in this system.
 
@@ -159,7 +161,7 @@ async function handleReport(req, res, body){
       method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
       body: JSON.stringify({
         contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
-        generationConfig:{ temperature: 0.2, maxOutputTokens: 3000 }
+        generationConfig:{ temperature: 0.2, maxOutputTokens: 1500 } // 3000→1500 01/09/2026: latency scales with output; prompt now asks for short answers by default
       })
     });
     const out = await apiResp.json();
