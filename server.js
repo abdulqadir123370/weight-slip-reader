@@ -159,39 +159,41 @@ async function handleReport(req, res, body){
   try{
     // Key moved from ?key= URL param to the x-goog-api-key header 29/08/2026 — Google's
     // recommended method; also keeps the key out of URLs (which end up in logs/proxies).
-    // 03/09/2026: 80s AbortController — without it a stalled Gemini call held the client's
-    // request open until the app's own 100s timeout fired, with nothing in the logs to show
-    // where the time went. Now the server always answers first, with a distinct message,
-    // and logs the Gemini leg's duration either way.
-    const geminiCtrl = new AbortController();
-    const geminiKiller = setTimeout(()=>geminiCtrl.abort(), 80000);
-    let apiResp;
-    try{
-      apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
-        signal: geminiCtrl.signal,
-        method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
-        body: JSON.stringify({
-          contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
-          // 03/09/2026 ROOT CAUSE of the 80s stalls: gemini-3.5-flash is a THINKING model —
-          // with no thinkingConfig it defaults to "medium" and reasons over the whole dataset
-          // before writing anything. thinkingLevel:'minimal' turns that nearly off (this job
-          // is quoting numbers from JSON, not deep reasoning). Thinking tokens also count
-          // against maxOutputTokens, so 1500 was starving the answer — back to 3000.
-          // NOTE: 3.5 uses thinkingLevel (string); do NOT add legacy thinkingBudget — mixing
-          // the two is a 400 error.
-          generationConfig:{ temperature: 0.2, maxOutputTokens: 3000, thinkingConfig:{ thinkingLevel:'minimal' } }
-        })
-      });
-    }catch(fe){
-      clearTimeout(geminiKiller);
-      if(fe && fe.name==='AbortError'){
-        console.error(`[report] gemini TIMED OUT after ${Date.now()-t0}ms`);
-        return json(res, 504, {success:false, error:'report model did not answer within 80s — the free AI tier is congested right now, try again in a minute'});
+    // 03/09/2026 v2: two attempts, 45s + 40s, instead of one 80s attempt. The free tier
+    // intermittently stalls a single request; a fresh retry usually answers in seconds.
+    // Total worst case 85s stays under the app's 100s client timeout.
+    let apiResp = null;
+    for(let attempt=1; attempt<=2 && !apiResp; attempt++){
+      const geminiCtrl = new AbortController();
+      const cap = attempt===1 ? 45000 : 40000;
+      const geminiKiller = setTimeout(()=>geminiCtrl.abort(), cap);
+      const a0 = Date.now();
+      try{
+        apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+          signal: geminiCtrl.signal,
+          method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
+          body: JSON.stringify({
+            contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
+            // thinkingLevel:'minimal' (03/09/2026): gemini-3.5-flash is a thinking model and
+            // defaults to "medium" — it was reasoning over the whole dataset before writing
+            // anything. This job is quoting numbers from JSON; minimal is correct and fast.
+            // 3.5 uses thinkingLevel (string); never add legacy thinkingBudget alongside it.
+            generationConfig:{ temperature: 0.2, maxOutputTokens: 3000, thinkingConfig:{ thinkingLevel:'minimal' } }
+          })
+        });
+        console.log(`[report] gemini attempt ${attempt} answered in ${Date.now()-a0}ms, status ${apiResp.status}`);
+      }catch(fe){
+        clearTimeout(geminiKiller);
+        if(fe && fe.name==='AbortError'){
+          console.error(`[report] gemini attempt ${attempt} TIMED OUT after ${Date.now()-a0}ms`);
+          if(attempt===2){ return json(res, 504, {success:false, error:'report model did not answer (2 attempts) — the free AI tier is congested right now, try again in a minute'}); }
+          continue;
+        }
+        console.error(`[report] gemini network error after ${Date.now()-a0}ms:`, fe && fe.message);
+        return json(res, 502, {success:false, error:'could not reach the report model (network error on the server side) — try again'});
       }
-      console.error(`[report] gemini network error after ${Date.now()-t0}ms:`, fe && fe.message);
-      return json(res, 502, {success:false, error:'could not reach the report model (network error on the server side) — try again'});
+      clearTimeout(geminiKiller);
     }
-    clearTimeout(geminiKiller);
     console.log(`[report] gemini answered in ${Date.now()-t0}ms, status ${apiResp.status}`);
     const out = await apiResp.json();
     if(!apiResp.ok){
