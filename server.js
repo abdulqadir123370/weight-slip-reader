@@ -70,7 +70,18 @@ const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 // the current free-tier GA model (confirmed against Google's own pricing page 16/08/2026:
 // genuinely free, not a "-preview" build that can vanish without notice, and the strongest
 // reasoning available at no cost — matters for complicated cost-analysis narration).
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+// 03/09/2026: report model moved to flash-LITE first. Railway logs showed even successful
+// 3.5-flash answers taking 48-63s at busy hours — free-tier queuing on the flagship flash.
+// Flash-Lite is built for exactly this workload (high-throughput data extraction), has a
+// free tier with less contention, and this job is quoting numbers from JSON.
+// Chain: env override → 3.5-flash-lite → 3.5-flash. A model that 404s is dropped for the
+// life of the process; the first model that answers becomes sticky (tried first next time).
+// All candidates are 3.x models, which take thinkingLevel (2.x models would reject it).
+// flash-lite deliberately FIRST even if a GEMINI_MODEL env var is set — the env var
+// stays in the chain as a fallback, it just no longer forces the congested flagship first.
+const GEMINI_MODEL_CANDIDATES = [...new Set(['gemini-3.5-flash-lite', process.env.GEMINI_MODEL, 'gemini-3.5-flash'].filter(Boolean))];
+let geminiStickyModel = null;
+const geminiDeadModels = new Set();
 
 // ============================================================================
 // /report — AI REPORT ASSISTANT (v5, added 13/08/2026 on Owner request)
@@ -159,42 +170,56 @@ async function handleReport(req, res, body){
   try{
     // Key moved from ?key= URL param to the x-goog-api-key header 29/08/2026 — Google's
     // recommended method; also keeps the key out of URLs (which end up in logs/proxies).
-    // 03/09/2026 v2: two attempts, 45s + 40s, instead of one 80s attempt. The free tier
-    // intermittently stalls a single request; a fresh retry usually answers in seconds.
-    // Total worst case 85s stays under the app's 100s client timeout.
-    let apiResp = null;
-    for(let attempt=1; attempt<=2 && !apiResp; attempt++){
+    // 03/09/2026 v2: up to 3 short attempts across the model chain instead of one 80s wait.
+    // A 404 drops that model permanently and doesn't burn an attempt; a timeout moves to the
+    // next model in the chain. Total worst case ~90s stays under the app's 100s timeout.
+    const modelList = [...new Set([geminiStickyModel, ...GEMINI_MODEL_CANDIDATES].filter(m=>m && !geminiDeadModels.has(m)))];
+    if(modelList.length===0){ return json(res, 500, {success:false, error:'no usable report model configured'}); }
+    let apiResp = null, usedModel = null;
+    let mi = 0;
+    for(let attempt=1; attempt<=3 && !apiResp; attempt++){
+      const model = modelList[Math.min(mi, modelList.length-1)];
       const geminiCtrl = new AbortController();
-      const cap = attempt===1 ? 45000 : 40000;
-      const geminiKiller = setTimeout(()=>geminiCtrl.abort(), cap);
+      const geminiKiller = setTimeout(()=>geminiCtrl.abort(), 30000);
       const a0 = Date.now();
+      let r;
       try{
-        apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+        r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
           signal: geminiCtrl.signal,
           method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
           body: JSON.stringify({
             contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
-            // thinkingLevel:'minimal' (03/09/2026): gemini-3.5-flash is a thinking model and
-            // defaults to "medium" — it was reasoning over the whole dataset before writing
-            // anything. This job is quoting numbers from JSON; minimal is correct and fast.
-            // 3.5 uses thinkingLevel (string); never add legacy thinkingBudget alongside it.
+            // thinkingLevel:'minimal': gemini 3.x flash models are thinking models and default
+            // to "medium" — reasoning over the whole dataset before writing. This job is
+            // quoting numbers from JSON. (3.x uses thinkingLevel; never mix with thinkingBudget.)
             generationConfig:{ temperature: 0.2, maxOutputTokens: 3000, thinkingConfig:{ thinkingLevel:'minimal' } }
           })
         });
-        console.log(`[report] gemini attempt ${attempt} answered in ${Date.now()-a0}ms, status ${apiResp.status}`);
       }catch(fe){
         clearTimeout(geminiKiller);
         if(fe && fe.name==='AbortError'){
-          console.error(`[report] gemini attempt ${attempt} TIMED OUT after ${Date.now()-a0}ms`);
-          if(attempt===2){ return json(res, 504, {success:false, error:'report model did not answer (2 attempts) — the free AI tier is congested right now, try again in a minute'}); }
+          console.error(`[report] ${model} attempt ${attempt} TIMED OUT after ${Date.now()-a0}ms`);
+          mi++; // try the next model in the chain
+          if(attempt===3){ return json(res, 504, {success:false, error:'report model did not answer (3 attempts) — the free AI tier is congested right now, try again in a minute'}); }
           continue;
         }
-        console.error(`[report] gemini network error after ${Date.now()-a0}ms:`, fe && fe.message);
+        console.error(`[report] ${model} network error after ${Date.now()-a0}ms:`, fe && fe.message);
         return json(res, 502, {success:false, error:'could not reach the report model (network error on the server side) — try again'});
       }
       clearTimeout(geminiKiller);
+      console.log(`[report] ${model} attempt ${attempt} answered in ${Date.now()-a0}ms, status ${r.status}`);
+      if(r.status===404){
+        // model name not available on this API/key — drop it for good, retry immediately
+        geminiDeadModels.add(model);
+        console.error(`[report] ${model} returned 404 — dropped from the chain`);
+        mi++; attempt--; // a 404 should not burn an attempt
+        const left = modelList.filter(m=>!geminiDeadModels.has(m));
+        if(left.length===0){ return json(res, 502, {success:false, error:'no report model available (all candidates 404)'}); }
+        continue;
+      }
+      apiResp = r; usedModel = model;
     }
-    console.log(`[report] gemini answered in ${Date.now()-t0}ms, status ${apiResp.status}`);
+    if(apiResp && apiResp.ok){ geminiStickyModel = usedModel; }
     const out = await apiResp.json();
     if(!apiResp.ok){
       console.error('Gemini API error:', apiResp.status, JSON.stringify(out).slice(0,300));
@@ -213,7 +238,7 @@ async function handleReport(req, res, body){
 
 const server = http.createServer((req, res) => {
   if(req.method === 'OPTIONS'){ return json(res, 204, {}); }
-  if(req.method === 'GET'){ return json(res, 200, {ok:true, service:'weight-slip-reader', version:5, dateExtraction:true, maundsCrossCheck:true, serialExtraction:true, reportAssistant:true, reportModel:GEMINI_MODEL}); }
+  if(req.method === 'GET'){ return json(res, 200, {ok:true, service:'weight-slip-reader', version:5, dateExtraction:true, maundsCrossCheck:true, serialExtraction:true, reportAssistant:true, reportModel:(geminiStickyModel||GEMINI_MODEL_CANDIDATES[0]), reportModelChain:GEMINI_MODEL_CANDIDATES}); }
   if(req.method !== 'POST' || !(req.url.startsWith('/read-slip') || req.url.startsWith('/report'))){ return json(res, 404, {success:false, error:'not found'}); }
 
   const auth = req.headers['authorization'] || '';
