@@ -172,7 +172,14 @@ async function handleReport(req, res, body){
         method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
         body: JSON.stringify({
           contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
-          generationConfig:{ temperature: 0.2, maxOutputTokens: 1500 } // 3000→1500 01/09/2026: latency scales with output; prompt now asks for short answers by default
+          // 03/09/2026 ROOT CAUSE of the 80s stalls: gemini-3.5-flash is a THINKING model —
+          // with no thinkingConfig it defaults to "medium" and reasons over the whole dataset
+          // before writing anything. thinkingLevel:'minimal' turns that nearly off (this job
+          // is quoting numbers from JSON, not deep reasoning). Thinking tokens also count
+          // against maxOutputTokens, so 1500 was starving the answer — back to 3000.
+          // NOTE: 3.5 uses thinkingLevel (string); do NOT add legacy thinkingBudget — mixing
+          // the two is a 400 error.
+          generationConfig:{ temperature: 0.2, maxOutputTokens: 3000, thinkingConfig:{ thinkingLevel:'minimal' } }
         })
       });
     }catch(fe){
