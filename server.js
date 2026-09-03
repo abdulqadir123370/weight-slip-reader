@@ -154,16 +154,38 @@ async function handleReport(req, res, body){
   if(!data || typeof data!=='object'){ return json(res, 400, {success:false, error:'missing data'}); }
   const dataStr = JSON.stringify(data);
   if(dataStr.length > 400000){ return json(res, 400, {success:false, error:'dataset too large'}); }
+  console.log(`[report] received: question ${question.length} chars, data ${Math.round(dataStr.length/1024)} KB`);
+  const t0 = Date.now();
   try{
     // Key moved from ?key= URL param to the x-goog-api-key header 29/08/2026 — Google's
     // recommended method; also keeps the key out of URLs (which end up in logs/proxies).
-    const apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
-      method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
-      body: JSON.stringify({
-        contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
-        generationConfig:{ temperature: 0.2, maxOutputTokens: 1500 } // 3000→1500 01/09/2026: latency scales with output; prompt now asks for short answers by default
-      })
-    });
+    // 03/09/2026: 80s AbortController — without it a stalled Gemini call held the client's
+    // request open until the app's own 100s timeout fired, with nothing in the logs to show
+    // where the time went. Now the server always answers first, with a distinct message,
+    // and logs the Gemini leg's duration either way.
+    const geminiCtrl = new AbortController();
+    const geminiKiller = setTimeout(()=>geminiCtrl.abort(), 80000);
+    let apiResp;
+    try{
+      apiResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+        signal: geminiCtrl.signal,
+        method:'POST', headers:{'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY},
+        body: JSON.stringify({
+          contents:[{ role:'user', parts:[{ text: REPORT_PROMPT_HEADER + '\n\nOWNER QUESTION:\n' + question + '\n\nDATASET (pre-computed by the tracking software):\n' + dataStr }] }],
+          generationConfig:{ temperature: 0.2, maxOutputTokens: 1500 } // 3000→1500 01/09/2026: latency scales with output; prompt now asks for short answers by default
+        })
+      });
+    }catch(fe){
+      clearTimeout(geminiKiller);
+      if(fe && fe.name==='AbortError'){
+        console.error(`[report] gemini TIMED OUT after ${Date.now()-t0}ms`);
+        return json(res, 504, {success:false, error:'report model did not answer within 80s — the free AI tier is congested right now, try again in a minute'});
+      }
+      console.error(`[report] gemini network error after ${Date.now()-t0}ms:`, fe && fe.message);
+      return json(res, 502, {success:false, error:'could not reach the report model (network error on the server side) — try again'});
+    }
+    clearTimeout(geminiKiller);
+    console.log(`[report] gemini answered in ${Date.now()-t0}ms, status ${apiResp.status}`);
     const out = await apiResp.json();
     if(!apiResp.ok){
       console.error('Gemini API error:', apiResp.status, JSON.stringify(out).slice(0,300));
